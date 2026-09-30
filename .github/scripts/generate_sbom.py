@@ -68,6 +68,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from email import message_from_bytes
 from pathlib import Path
@@ -124,6 +125,31 @@ GITHUB_SUBMODULE_URL = re.compile(
 # a gitlink, which is what a submodule is recorded as in the tree that
 # carries it, whether or not the submodule was ever checked out
 GITLINK = re.compile(r"^160000 commit (?P<sha>[0-9a-f]{40})\t")
+
+# where a tree records the findings it has judged not to affect its
+# release, relative to the repository root. TOML because a finding is a
+# judgement and the reason is what makes it one: a comment can carry the
+# evidence beside the entry, which JSON has no place for
+VEX = Path(".github") / "vex.toml"
+
+# the keys of one `[[not_affected]]` table, all required: a finding
+# without its justification or its detail is a claim nobody can check
+VEX_KEYS = frozenset({"id", "source", "component", "justification", "detail"})
+
+# CycloneDX 1.6's `impactAnalysisJustification`, the whole enumeration
+JUSTIFICATIONS = frozenset(
+    {
+        "code_not_present",
+        "code_not_reachable",
+        "requires_configuration",
+        "requires_dependency",
+        "requires_environment",
+        "protected_by_compiler",
+        "protected_at_runtime",
+        "protected_at_perimeter",
+        "protected_by_mitigating_control",
+    }
+)
 
 # resolved once: S607 is what a bare "git" in a subprocess list would be,
 # a partial executable path relying on PATH's own search order rather
@@ -356,6 +382,76 @@ def submodule_components(repo_root: Path) -> list[dict[str, Any]]:
     ]
 
 
+def vulnerabilities(
+    repo_root: Path, components: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return the tree's not-affected findings, as CycloneDX says them.
+
+    Refused rather than skipped where an entry is not one this can state
+    whole, or names a component the document does not carry: a finding
+    about a package that is not in the files is either a typo, and so an
+    answer that silently answers nothing, or a dependency that left, and
+    the entry is then stale. A tree with no file, or an empty one, states
+    none, and the document has no `vulnerabilities` key at all: an empty
+    array would say the tree looked and found nothing to report, which is
+    a claim about the tree's process this script cannot check.
+    """
+    path = repo_root / VEX
+    if not path.is_file():
+        return []
+    with path.open("rb") as stream:
+        findings = tomllib.load(stream).get("not_affected", [])
+
+    references: dict[str, str] = {}
+    for entry in components:
+        # a submodule's name is its upstream repository's, so a dependency
+        # and a submodule can spell one name: an entry naming it would be
+        # ambiguous, and is refused below rather than resolved by order
+        key = canonical_name(str(entry["name"]))
+        if key in references:
+            references[key] = ""
+        else:
+            references[key] = str(entry["bom-ref"])
+    result = []
+    for finding in findings:
+        if set(finding) != VEX_KEYS or not all(
+            isinstance(value, str) and value for value in finding.values()
+        ):
+            msg = f"{VEX}: an entry needs exactly {sorted(VEX_KEYS)}, got {finding!r}"
+            raise SystemExit(msg)
+        if finding["justification"] not in JUSTIFICATIONS:
+            msg = (
+                f"{VEX}: {finding['id']} has the justification "
+                f"{finding['justification']!r}"
+            )
+            raise SystemExit(msg)
+        name = canonical_name(finding["component"])
+        if name not in references:
+            msg = (
+                f"{VEX}: {finding['id']} names {name}, "
+                "which this document does not carry"
+            )
+            raise SystemExit(msg)
+        if not references[name]:
+            msg = (
+                f"{VEX}: {finding['id']} names {name}, which the document carries twice"
+            )
+            raise SystemExit(msg)
+        result.append(
+            {
+                "id": finding["id"],
+                "source": {"name": finding["source"]},
+                "affects": [{"ref": references[name]}],
+                "analysis": {
+                    "state": "not_affected",
+                    "justification": finding["justification"],
+                    "detail": finding["detail"],
+                },
+            }
+        )
+    return sorted(result, key=lambda entry: (entry["id"], entry["affects"][0]["ref"]))
+
+
 def build_sbom(wheel: Path, sdist: Path, epoch: int, repo_root: Path) -> dict[str, Any]:
     """Return the CycloneDX document describing the two files."""
     metadata = wheel_metadata(wheel)
@@ -412,8 +508,9 @@ def build_sbom(wheel: Path, sdist: Path, epoch: int, repo_root: Path) -> dict[st
         + submodule_components(repo_root),
         key=lambda dependency: str(dependency["bom-ref"]),
     )
+    findings = vulnerabilities(repo_root, [root, *components])
     serial = f"{reference}:{file_hash(wheel)}:{file_hash(sdist)}"
-    return {
+    document: dict[str, Any] = {
         "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
@@ -436,6 +533,9 @@ def build_sbom(wheel: Path, sdist: Path, epoch: int, repo_root: Path) -> dict[st
             *({"ref": entry["bom-ref"], "dependsOn": []} for entry in components),
         ],
     }
+    if findings:
+        document["vulnerabilities"] = findings
+    return document
 
 
 def one_of(directory: Path, pattern: str) -> Path:
